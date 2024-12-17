@@ -1,0 +1,2 @@
+Win32_Devices_Display
+Win32_Foundation

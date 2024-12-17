@@ -9,6 +9,7 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::path::PathBuf;
 use tokio::process::Command as TokioCommand;
 use tracing::debug;
 use tracing::error;
@@ -65,10 +66,7 @@ async fn main() -> Result<()> {
 
     let debug_enabled = matches.get_flag("debug");
     let quiet = matches.get_flag("quiet");
-    let scan_dir = matches
-        .get_one::<String>("scan_dir")
-        .map(|s| s.to_string())
-        .unwrap();
+    let scan_dir = matches.get_one::<PathBuf>("scan_dir").unwrap();
 
     // Setup tracing for logging
     {
@@ -89,7 +87,7 @@ async fn main() -> Result<()> {
     info!("Starting windows-features tool");
     debug!("Debug mode enabled: {}", debug_enabled);
     debug!("Quiet mode: {}", quiet);
-    debug!("Scan directory: {}", scan_dir);
+    debug!("Scan directory: {}", scan_dir.display());
 
     // Run ripgrep to find windows imports
     let imports = find_imports(&scan_dir).await?;
@@ -113,24 +111,45 @@ async fn main() -> Result<()> {
 async fn get_required_features(imports: Vec<String>) -> Result<BTreeSet<String>> {
     let item_to_features = load_feature_mapping().await?;
     let mut required_features = BTreeSet::new();
-    for import in imports {
-        // Extract file path and import line
-        let (_file_path, import_line) = parse_import_line(&import)?;
 
-        // Get the full namespace and item name
-        if let Some((_namespace, item)) = parse_namespace_and_item(&import_line) {
-            if let Some(features) = item_to_features.get(&item) {
-                required_features.extend(features.clone());
-            } else {
-                // Attempt to handle the LLM hallucination scenario:
-                // The code tries to guess the correct namespace by the item name.
-                if let Some(correct_feats) = attempt_fix_import(&item_to_features, &item) {
+    for import in imports {
+        let (_file_path, import_line) = parse_import_line(&import)?;
+        if let Some((namespace, item_opt)) = parse_namespace_and_item(&import_line) {
+            if let Some(item) = item_opt {
+                // Specific import: Look up using fully qualified name
+                let full_name = format!("{}.{}", namespace, item);
+                if let Some(features) = item_to_features.get(&full_name) {
+                    required_features.extend(features.clone());
+                } else if let Some(correct_feats) =
+                    attempt_fix_import(&item_to_features, &full_name)
+                {
                     required_features.extend(correct_feats);
                 } else {
                     warn!(
                         "No features found for item: {} (import: {})",
-                        item, import_line
+                        full_name, import_line
                     );
+                }
+            } else {
+                // Wildcard import: Gather all items under this namespace
+                let namespace_prefix = format!("{}.", namespace);
+                info!("Processing wildcard import for namespace: {}", namespace);
+                let matching_features = item_to_features
+                    .iter()
+                    .filter_map(|(fullname, feats)| {
+                        if fullname.starts_with(&namespace_prefix) {
+                            Some(feats.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .flatten()
+                    .collect::<BTreeSet<_>>();
+
+                if matching_features.is_empty() {
+                    warn!("No features found for namespace: {}", namespace);
+                } else {
+                    required_features.extend(matching_features);
                 }
             }
         } else {
@@ -201,15 +220,16 @@ fn build_feature_mappings(features: &FeaturesFile) -> Result<BTreeMap<String, BT
             warn!("Index {} out of range for namespace_map", idx);
             continue;
         }
-        let mut namespace_features = BTreeSet::new();
+
+        let namespace = &features.namespace_map[idx];
+
         for entry in entries {
+            let full_name = format!("{}.{}", namespace, entry.name);
             if let Some(feature_indexes) = &entry.features {
                 for &fi in feature_indexes {
                     if let Some(feature_name) = features.feature_map.get(fi) {
-                        namespace_features.insert(feature_name.clone());
-                        // Also map the individual item to its features
                         item_to_features
-                            .entry(entry.name.clone())
+                            .entry(full_name.clone())
                             .or_insert_with(BTreeSet::new)
                             .insert(feature_name.clone());
                     } else {
@@ -225,7 +245,7 @@ fn build_feature_mappings(features: &FeaturesFile) -> Result<BTreeMap<String, BT
 
 /// Runs ripgrep to find imports and returns a Vec of lines matching `use windows::`
 /// The expected format is `file_path:use windows::...;`
-async fn find_imports(scan_dir: &str) -> Result<Vec<String>> {
+async fn find_imports(scan_dir: &PathBuf) -> Result<Vec<String>> {
     // rg "use windows::" --type rust --no-heading --no-line-number
     let output = TokioCommand::new("rg")
         .arg("use windows::")
@@ -264,49 +284,47 @@ fn parse_import_line(line: &str) -> Result<(String, String)> {
     Ok((file_path, import_line))
 }
 
-/// Given an import line like `use windows::Win32::Graphics::Gdi::DisplayConfigGetDeviceInfo;`,
-/// reconstruct the namespace and extract the item name.
-fn parse_namespace_and_item(import_line: &str) -> Option<(String, String)> {
+/// Given an import line, reconstruct the namespace and extract the item name.
+/// Supports both specific imports and wildcard imports (`::*`).
+fn parse_namespace_and_item(import_line: &str) -> Option<(String, Option<String>)> {
     let line = import_line.trim_end_matches(';').trim();
     let parts: Vec<&str> = line.split("::").collect();
     if parts.len() < 3 {
         return None;
     }
 
-    // Ex: use windows::Win32::Graphics::Gdi::DisplayConfigGetDeviceInfo
-    // parts = ["use windows", "Win32", "Graphics", "Gdi", "DisplayConfigGetDeviceInfo"]
-    // Reconstruct namespace: Windows.Win32.Graphics.Gdi
-    // Item: DisplayConfigGetDeviceInfo
+    if *parts.last()? == "*" {
+        // Wildcard import
+        let namespace_parts = &parts[1..parts.len() - 1];
+        let namespace = format!("Windows.{}", namespace_parts.join("."));
+        return Some((namespace, None));
+    }
 
+    // Specific import
     let namespace_parts = &parts[1..parts.len() - 1];
     let item = parts.last()?.to_string();
     let namespace = format!("Windows.{}", namespace_parts.join("."));
 
-    Some((namespace, item))
+    Some((namespace, Some(item)))
 }
 
 /// Attempt to fix a mis-namespaced import by searching for the item name in all namespaces
 fn attempt_fix_import(
     item_to_features: &BTreeMap<String, BTreeSet<String>>,
-    item_name: &str,
+    full_name: &str,
 ) -> Option<BTreeSet<String>> {
-    // Search for the item name across all items
-    for (existing_item, feats) in item_to_features {
-        if existing_item.eq_ignore_ascii_case(item_name) {
-            warn!(
-                "Corrected namespace for {} to match item name: {}",
-                item_name, existing_item
-            );
-            return Some(feats.clone());
-        }
-    }
+    // Attempt a relaxed matching by ignoring case or checking if the last segment matches
+    // But typically, if we got here with a fully qualified name, it might be a true mismatch.
 
-    // As a fallback, perform a case-sensitive search
+    let item_segment = full_name.split('.').last()?;
+
+    // Case-insensitive search for fallback
     for (existing_item, feats) in item_to_features {
-        if existing_item == item_name {
+        let existing_segment = existing_item.split('.').last()?;
+        if existing_segment.eq_ignore_ascii_case(item_segment) {
             warn!(
-                "Corrected namespace for {} to match item name: {}",
-                item_name, existing_item
+                "Corrected namespace for {} to match existing item: {}",
+                full_name, existing_item
             );
             return Some(feats.clone());
         }
@@ -317,50 +335,36 @@ fn attempt_fix_import(
 
 #[cfg(test)]
 mod test {
-    use itertools::Itertools;
+    use crate::find_imports;
+    use crate::get_required_features;
+    use eyre::bail;
+    use std::path::PathBuf;
 
     #[tokio::test]
-    async fn load_or_download_features_file() -> eyre::Result<()> {
-        let _ = super::load_feature_mapping().await?;
-        Ok(())
-    }
-    #[tokio::test]
-    async fn features_devices_display() -> eyre::Result<()> {
-        let imports = r#"
-use windows::Win32::Devices::Display::DisplayConfigGetDeviceInfo;
-use windows::Win32::Devices::Display::DisplayConfigSetDeviceInfo;
-use windows::Win32::Devices::Display::GetDisplayConfigBufferSizes;
-use windows::Win32::Devices::Display::QueryDisplayConfig;
-use windows::Win32::Devices::Display::DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
-use windows::Win32::Devices::Display::DISPLAYCONFIG_DEVICE_INFO_HEADER;
-use windows::Win32::Devices::Display::DISPLAYCONFIG_DEVICE_INFO_TYPE;
-use windows::Win32::Devices::Display::DISPLAYCONFIG_MODE_INFO;
-use windows::Win32::Devices::Display::DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE;
-use windows::Win32::Devices::Display::DISPLAYCONFIG_PATH_INFO;
-use windows::Win32::Devices::Display::DISPLAYCONFIG_SOURCE_MODE;
-use windows::Win32::Devices::Display::DISPLAYCONFIG_TARGET_DEVICE_NAME;
-use windows::Win32::Devices::Display::QDC_ONLY_ACTIVE_PATHS;
-use windows::Win32::Devices::Display::QUERY_DISPLAY_CONFIG_FLAGS;
-        "#
-        .trim()
-        .lines()
-        .map(|s| s.to_string())
-        .collect_vec();
-        let features = super::get_required_features(imports).await?;
-        assert_eq!(features, ["Win32_Devices_Display".to_string(), "Win32_Foundation".to_string()].into());
-        Ok(())
-    }
-    #[tokio::test]
-    async fn features_wildcard() -> eyre::Result<()> {
-        let imports = r#"
-use windows::Win32::UI::WindowsAndMessaging::*;
-        "#
-        .trim()
-        .lines()
-        .map(|s| s.to_string())
-        .collect_vec();
-        let features = super::get_required_features(imports).await?;
-        assert_eq!(features, ["Win32_UI_WindowsAndMessaging".to_string()].into());
+    async fn test_dir() -> eyre::Result<()> {
+        // tests/**/expected.txt,test.rs
+        // we want to run the program against each fo those dirs
+        let test_container_dir = PathBuf::from("tests");
+        let mut test_dirs = tokio::fs::read_dir(&test_container_dir).await?;
+        while let Some(dir) = test_dirs.next_entry().await? {
+            let dir_path = dir.path();
+            if dir_path.is_dir() {
+                let dir_name = dir_path.file_name().unwrap().to_str().unwrap();
+                println!("Running test for {}", dir_name);
+                let expected_file = dir_path.join("expected.txt");
+                let expected = tokio::fs::read_to_string(&expected_file).await?;
+                let imports = find_imports(&dir_path).await?;
+                if imports.is_empty() {
+                    bail!("No 'use windows::' imports found.");
+                }
+
+                let required_features = get_required_features(imports).await?;
+                assert_eq!(
+                    required_features,
+                    expected.lines().map(|s| s.to_string()).collect()
+                );
+            }
+        }
         Ok(())
     }
 }
