@@ -66,7 +66,7 @@ async fn main() -> Result<()> {
 
     let debug_enabled = matches.get_flag("debug");
     let quiet = matches.get_flag("quiet");
-    let scan_dir = matches.get_one::<PathBuf>("scan_dir").unwrap();
+    let scan_dir = PathBuf::from(matches.get_one::<String>("scan_dir").unwrap());
 
     // Setup tracing for logging
     {
