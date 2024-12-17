@@ -6,8 +6,6 @@ use color_eyre::eyre::WrapErr;
 use directories::ProjectDirs;
 use itertools::Itertools;
 use serde::Deserialize;
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -17,6 +15,8 @@ use tracing::error;
 use tracing::info;
 use tracing::warn;
 use tracing_subscriber::fmt;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 
 /// The structure of the features.json based on the sample
@@ -109,7 +109,7 @@ async fn main() -> Result<()> {
     // Build mappings:
     // 1. Namespace -> Features
     // 2. Item -> Features
-    let (namespace_to_features, item_to_features) = build_feature_mappings(&features)?;
+    let item_to_features = build_feature_mappings(&features)?;
 
     // Run ripgrep to find windows imports
     let imports = find_imports(&scan_dir).await?;
@@ -121,7 +121,7 @@ async fn main() -> Result<()> {
     for import in &imports {
         debug!("Processing import: {}", import);
         // Extract file path and import line
-        let (file_path, import_line) = parse_import_line(import)?;
+        let (_file_path, import_line) = parse_import_line(import)?;
 
         // Get the full namespace and item name
         if let Some((ns, item)) = parse_namespace_and_item(&import_line) {
@@ -134,7 +134,7 @@ async fn main() -> Result<()> {
             } else {
                 // Attempt to handle the LLM hallucination scenario:
                 // The code tries to guess the correct namespace by the item name.
-                if let Some(correct_feats) = attempt_fix_import(&features, &item_to_features, &item)
+                if let Some(correct_feats) = attempt_fix_import(&item_to_features, &item)
                 {
                     required_features.extend(correct_feats);
                 } else {
@@ -192,25 +192,15 @@ async fn load_or_download_features_file(path: &Path) -> Result<FeaturesFile> {
 }
 
 /// Builds mappings:
-/// 1. Namespace -> Features
-/// 2. Item -> Features
-fn build_feature_mappings(
-    features: &FeaturesFile,
-) -> Result<(
-    BTreeMap<String, BTreeSet<String>>,
-    BTreeMap<String, BTreeSet<String>>,
-)> {
-    let mut namespace_to_features = BTreeMap::new();
+/// - Item -> Features
+fn build_feature_mappings(features: &FeaturesFile) -> Result<BTreeMap<String, BTreeSet<String>>> {
     let mut item_to_features = BTreeMap::new();
-
     for (idx_str, entries) in &features.namespaces {
         let idx: usize = idx_str.parse().wrap_err("Invalid namespace index")?;
         if idx >= features.namespace_map.len() {
             warn!("Index {} out of range for namespace_map", idx);
             continue;
         }
-        let namespace = &features.namespace_map[idx];
-
         let mut namespace_features = BTreeSet::new();
         for entry in entries {
             if let Some(feature_indexes) = &entry.features {
@@ -228,11 +218,9 @@ fn build_feature_mappings(
                 }
             }
         }
-
-        namespace_to_features.insert(namespace.clone(), namespace_features);
     }
 
-    Ok((namespace_to_features, item_to_features))
+    Ok(item_to_features)
 }
 
 /// Runs ripgrep to find imports and returns a Vec of lines matching `use windows::`
@@ -299,7 +287,6 @@ fn parse_namespace_and_item(import_line: &str) -> Option<(String, String)> {
 
 /// Attempt to fix a mis-namespaced import by searching for the item name in all namespaces
 fn attempt_fix_import(
-    features: &FeaturesFile,
     item_to_features: &BTreeMap<String, BTreeSet<String>>,
     item_name: &str,
 ) -> Option<BTreeSet<String>> {
