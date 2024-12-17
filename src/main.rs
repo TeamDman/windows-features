@@ -91,51 +91,40 @@ async fn main() -> Result<()> {
     debug!("Quiet mode: {}", quiet);
     debug!("Scan directory: {}", scan_dir);
 
-    // Determine project directories for storing data
-    let project_dirs = ProjectDirs::from("ca", "teamdman", "windows-features")
-        .ok_or_else(|| eyre!("Could not determine project directories"))?;
-    let data_dir = project_dirs.data_dir();
-    tokio::fs::create_dir_all(data_dir)
-        .await
-        .wrap_err("Failed to create data directory")?;
-
-    let features_file = data_dir.join("features.json");
-    let features = load_or_download_features_file(&features_file).await?;
-    debug!(
-        "Loaded features.json with {} namespaces",
-        features.namespace_map.len()
-    );
-
-    // Build mappings:
-    // 1. Namespace -> Features
-    // 2. Item -> Features
-    let item_to_features = build_feature_mappings(&features)?;
-
     // Run ripgrep to find windows imports
     let imports = find_imports(&scan_dir).await?;
     if imports.is_empty() {
         warn!("No 'use windows::' imports found.");
     }
 
+    let required_features = get_required_features(imports).await?;
+
+    // Print required features
+    if !quiet {
+        eprintln!("Required windows-rs features:");
+    }
+    for f in &required_features {
+        println!("{}", f);
+    }
+
+    Ok(())
+}
+
+async fn get_required_features(imports: Vec<String>) -> Result<BTreeSet<String>> {
+    let item_to_features = load_feature_mapping().await?;
     let mut required_features = BTreeSet::new();
-    for import in &imports {
-        debug!("Processing import: {}", import);
+    for import in imports {
         // Extract file path and import line
-        let (_file_path, import_line) = parse_import_line(import)?;
+        let (_file_path, import_line) = parse_import_line(&import)?;
 
         // Get the full namespace and item name
-        if let Some((ns, item)) = parse_namespace_and_item(&import_line) {
-            debug!("  -> Reconstructed Namespace: {}", ns);
-            debug!("  -> Imported Item: {}", item);
-
+        if let Some((_namespace, item)) = parse_namespace_and_item(&import_line) {
             if let Some(features) = item_to_features.get(&item) {
-                debug!("     Found features for item: {:?}", features);
                 required_features.extend(features.clone());
             } else {
                 // Attempt to handle the LLM hallucination scenario:
                 // The code tries to guess the correct namespace by the item name.
-                if let Some(correct_feats) = attempt_fix_import(&item_to_features, &item)
-                {
+                if let Some(correct_feats) = attempt_fix_import(&item_to_features, &item) {
                     required_features.extend(correct_feats);
                 } else {
                     warn!(
@@ -152,15 +141,26 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Print required features
-    if !quiet {
-        eprintln!("Required windows-rs features:");
-    }
-    for f in &required_features {
-        println!("{}", f);
-    }
+    Ok(required_features)
+}
 
-    Ok(())
+async fn load_feature_mapping() -> Result<BTreeMap<String, BTreeSet<String>>> {
+    // Determine project directories for storing data
+    let project_dirs = ProjectDirs::from("ca", "teamdman", "windows-features")
+        .ok_or_else(|| eyre!("Could not determine project directories"))?;
+    let data_dir = project_dirs.data_dir();
+    tokio::fs::create_dir_all(data_dir)
+        .await
+        .wrap_err("Failed to create data directory")?;
+
+    let features_file = data_dir.join("features.json");
+    let features = load_or_download_features_file(&features_file).await?;
+    debug!(
+        "Loaded features.json with {} namespaces",
+        features.namespace_map.len()
+    );
+    let item_to_features = build_feature_mappings(&features)?;
+    Ok(item_to_features)
 }
 
 /// Downloads or loads the features.json file
@@ -313,4 +313,54 @@ fn attempt_fix_import(
     }
 
     None
+}
+
+#[cfg(test)]
+mod test {
+    use itertools::Itertools;
+
+    #[tokio::test]
+    async fn load_or_download_features_file() -> eyre::Result<()> {
+        let _ = super::load_feature_mapping().await?;
+        Ok(())
+    }
+    #[tokio::test]
+    async fn features_devices_display() -> eyre::Result<()> {
+        let imports = r#"
+use windows::Win32::Devices::Display::DisplayConfigGetDeviceInfo;
+use windows::Win32::Devices::Display::DisplayConfigSetDeviceInfo;
+use windows::Win32::Devices::Display::GetDisplayConfigBufferSizes;
+use windows::Win32::Devices::Display::QueryDisplayConfig;
+use windows::Win32::Devices::Display::DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
+use windows::Win32::Devices::Display::DISPLAYCONFIG_DEVICE_INFO_HEADER;
+use windows::Win32::Devices::Display::DISPLAYCONFIG_DEVICE_INFO_TYPE;
+use windows::Win32::Devices::Display::DISPLAYCONFIG_MODE_INFO;
+use windows::Win32::Devices::Display::DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE;
+use windows::Win32::Devices::Display::DISPLAYCONFIG_PATH_INFO;
+use windows::Win32::Devices::Display::DISPLAYCONFIG_SOURCE_MODE;
+use windows::Win32::Devices::Display::DISPLAYCONFIG_TARGET_DEVICE_NAME;
+use windows::Win32::Devices::Display::QDC_ONLY_ACTIVE_PATHS;
+use windows::Win32::Devices::Display::QUERY_DISPLAY_CONFIG_FLAGS;
+        "#
+        .trim()
+        .lines()
+        .map(|s| s.to_string())
+        .collect_vec();
+        let features = super::get_required_features(imports).await?;
+        assert_eq!(features, ["Win32_Devices_Display".to_string(), "Win32_Foundation".to_string()].into());
+        Ok(())
+    }
+    #[tokio::test]
+    async fn features_wildcard() -> eyre::Result<()> {
+        let imports = r#"
+use windows::Win32::UI::WindowsAndMessaging::*;
+        "#
+        .trim()
+        .lines()
+        .map(|s| s.to_string())
+        .collect_vec();
+        let features = super::get_required_features(imports).await?;
+        assert_eq!(features, ["Win32_UI_WindowsAndMessaging".to_string()].into());
+        Ok(())
+    }
 }
