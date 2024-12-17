@@ -1,0 +1,1 @@
+cargo run -- --scan-dir "D:\Repos\rust\monitor-scaling" --debug
